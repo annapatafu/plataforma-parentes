@@ -606,15 +606,19 @@ const artifactBackend=db=>({
 /* ---- implementación sobre Firebase (Firestore) ----
    Cada colegio es un «inquilino»: lo suyo vive en schools/{colegio}/{colección}/{id} para que las reglas de seguridad
    puedan garantizar que nadie vea lo de otro colegio. Los documentos sin colegio van a schools/_global/… (los lee todo el mundo,
-   los escribe Parentes). Un documento con varios colegios se guarda bajo el primero.
+   los escribe Parentes). Un documento de varios colegios se guarda en cada uno de ellos (una copia por colegio), para que todos lo vean.
    Fundación Parentes (superadmin) lee con consultas de grupo; el resto, una escucha por cada uno de sus colegios. */
 const firebaseBackend=fb=>{
   const {db,fs,profile}=fb;
   const DATA=['events','contents','ideas','tasks','campaigns'];
   const sup=profile.rol==='superadmin';
   const owner={};DATA.forEach(c=>owner[c]={});
+  const known={};DATA.forEach(c=>known[c]={});   /* en qué colegios está cada documento (se actualiza con cada cambio, aunque la copia local aún no lo refleje) */
   const part={};DATA.forEach(c=>part[c]={});
   const sidOf=d=>(d&&Array.isArray(d.schools)&&d.schools[0])||'_global';
+  const sidsOf=d=>{const a=d&&Array.isArray(d.schools)?[...new Set(d.schools.filter(Boolean))]:[];return a.length?a:['_global']};
+  /* varias escrituras: vale si al menos una sale bien (un colaborador no puede escribir en colegios que no son suyos) */
+  const some=async ps=>{const r=await Promise.allSettled(ps);if(r.length&&r.every(x=>x.status==='rejected'))throw r[0].reason};
   const path=(col,id,sid)=>DATA.includes(col)?'schools/'+sid+'/'+col+'/'+id:col+'/'+id;
   const plain=o=>JSON.parse(JSON.stringify(o));
   const merge=col=>{const o={};Object.values(part[col]).forEach(m=>Object.assign(o,m));cache[col]=o};
@@ -622,24 +626,26 @@ const firebaseBackend=fb=>{
   return {
     newId:()=>fs.doc(fs.collection(db,'_ids')).id,
     async create(col,id,data){
-      const d=plain(data);const sid=sidOf(d);
-      if(DATA.includes(col))owner[col][id]=sid;
-      await fs.setDoc(fs.doc(db,path(col,id,sid)),d);
+      const d=plain(data);
+      if(!DATA.includes(col)){await fs.setDoc(fs.doc(db,path(col,id)),d);return}
+      const sids=sidsOf(d);owner[col][id]=sids[0];known[col][id]=sids;
+      await some(sids.map(sid=>fs.setDoc(fs.doc(db,path(col,id,sid)),d)));
     },
     async update(col,id,patch){
       const p=plain(patch);
       if(!DATA.includes(col)){await fs.updateDoc(fs.doc(db,col+'/'+id),p);return}
-      const sid=owner[col][id]||sidOf(cache[col][id]);
-      const merged={...(cache[col][id]||{}),...p};const nsid=sidOf(merged);
-      if(nsid===sid){await fs.updateDoc(fs.doc(db,path(col,id,sid)),p);return}
-      // el documento cambia de colegio: se crea en el nuevo y se borra del antiguo, en una sola operación
-      const b=fs.writeBatch(db);
-      b.set(fs.doc(db,path(col,id,nsid)),merged);b.delete(fs.doc(db,path(col,id,sid)));
-      await b.commit();owner[col][id]=nsid;
+      const prev=cache[col][id]||(known[col][id]?{schools:known[col][id].filter(x=>x!=='_global')}:{});
+      const before=known[col][id]||sidsOf(prev),merged={...prev,...p},after=sidsOf(merged);
+      const ops=[];
+      after.forEach(sid=>ops.push(before.includes(sid)?fs.updateDoc(fs.doc(db,path(col,id,sid)),p):fs.setDoc(fs.doc(db,path(col,id,sid)),merged)));
+      before.filter(sid=>!after.includes(sid)).forEach(sid=>ops.push(fs.deleteDoc(fs.doc(db,path(col,id,sid)))));
+      known[col][id]=after;await some(ops);owner[col][id]=after[0];
     },
     async remove(col,id){
-      const sid=DATA.includes(col)?(owner[col][id]||sidOf(cache[col][id])):null;
-      await fs.deleteDoc(fs.doc(db,path(col,id,sid)));
+      if(!DATA.includes(col)){await fs.deleteDoc(fs.doc(db,path(col,id)));return}
+      const sids=known[col][id]||sidsOf(cache[col][id]||{schools:owner[col][id]?[owner[col][id]]:[]});
+      delete known[col][id];
+      await some(sids.map(sid=>fs.deleteDoc(fs.doc(db,path(col,id,sid)))));
     },
     watch(col){
       if(!DATA.includes(col)){
@@ -648,14 +654,14 @@ const firebaseBackend=fb=>{
       }
       if(sup){
         fs.onSnapshot(fs.collectionGroup(db,col),snap=>{
-          const o={};snap.docs.forEach(d=>{owner[col][d.id]=d.ref.parent.parent?d.ref.parent.parent.id:'_global';o[d.id]=d.data()});
+          const o={};snap.docs.forEach(d=>{owner[col][d.id]=d.ref.parent.parent?d.ref.parent.parent.id:'_global';o[d.id]=d.data();known[col][d.id]=sidsOf(d.data())});
           part[col]={all:o};merge(col);ready.add(col);emit(col)},e=>{ready.add(col);err(e);emit(col)});
         return;
       }
       const keys=[...new Set([...(profile.schools||[]),'_global'])];const done=new Set();
       const finish=k=>{done.add(k);if(done.size===keys.length)ready.add(col);emit(col)};
       keys.forEach(k=>fs.onSnapshot(fs.collection(db,'schools/'+k+'/'+col),snap=>{
-        const o={};snap.docs.forEach(d=>{owner[col][d.id]=k;o[d.id]=d.data()});
+        const o={};snap.docs.forEach(d=>{owner[col][d.id]=k;o[d.id]=d.data();known[col][d.id]=sidsOf(d.data())});
         part[col][k]=o;merge(col);finish(k)},e=>{err(e);finish(k)}));
     }
   };
